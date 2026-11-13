@@ -5,7 +5,7 @@ from pydantic import BaseModel, Field
 
 from langchain_ollama import ChatOllama
 from langchain_core.tools import tool
-from langchain_core.messages import HumanMessage, SystemMessage, BaseMessage, ToolMessage
+from langchain_core.messages import HumanMessage, SystemMessage, BaseMessage, ToolMessage, AIMessage
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
@@ -13,22 +13,32 @@ from langgraph.prebuilt import ToolNode
 REPO_ROOT = Path(".").resolve()
 IGNORE_DIRS = {".venv", "venv", ".git", "__pycache__", "node_modules", ".idea", ".vscode", "dist", "build"}
 IGNORE_FILES = {"audit_report.md"}
-ALLOWED_EXTS = {".py", ".sh", ".js", ".ts", ".go", ".rs", ".yaml", ".yml", ".toml"}
+CODE_EXTS = {".py", ".sh", ".js", ".ts", ".go", ".rs"}
+DOC_CONFIG_EXTS = {".yaml", ".yml", ".toml", ".md", ".txt", ".json"}
+ALLOWED_EXTS = CODE_EXTS | DOC_CONFIG_EXTS
+
+
+def _discover_files() -> List[str]:
+    code_files, other_files = [], []
+    for p in REPO_ROOT.rglob("*"):
+        if any(part in IGNORE_DIRS for part in p.parts) or p.name in IGNORE_FILES:
+            continue
+        if p.is_file() and p.suffix in ALLOWED_EXTS:
+            rel = str(p.relative_to(REPO_ROOT))
+            if p.suffix in CODE_EXTS:
+                code_files.append(rel)
+            else:
+                other_files.append(rel)
+    return sorted(code_files) + sorted(other_files)
 
 
 # --- 1. Agent Tools ---
 @tool
 def list_repo_files() -> str:
-    """List up to 60 key source and config files in the target repository."""
-    files = []
-    for p in REPO_ROOT.rglob("*"):
-        if any(part in IGNORE_DIRS for part in p.parts) or p.name in IGNORE_FILES:
-            continue
-        if p.is_file() and p.suffix in ALLOWED_EXTS:
-            files.append(str(p.relative_to(REPO_ROOT)))
-    files = sorted(files)
+    """List up to 60 key source, config, and documentation files in the target repository."""
+    files = _discover_files()
     if not files:
-        return "No supported source files found."
+        return "No supported files found."
     if len(files) > 60:
         return "\n".join(files[:60]) + f"\n... ({len(files) - 60} more files; use search_code to locate specific modules)"
     return "\n".join(files)
@@ -36,7 +46,7 @@ def list_repo_files() -> str:
 
 @tool
 def read_file(relative_path: str) -> str:
-    """Read the contents of a specific source file in the repository."""
+    """Read the contents of a specific file in the repository."""
     target = (REPO_ROOT / relative_path).resolve()
     if not str(target).startswith(str(REPO_ROOT)) or not target.is_file():
         return f"Error: File '{relative_path}' does not exist or is outside the repository."
@@ -67,7 +77,7 @@ tools = [list_repo_files, read_file, search_code]
 class RepoAuditReport(BaseModel):
     project_summary: str = Field(description="Technical overview of what this repository does.")
     severity: Literal["LOW", "MEDIUM", "HIGH"] = Field(description="Overall code/security risk severity.")
-    files_inspected: List[str] = Field(description="Exact relative paths of files read via read_file.")
+    files_inspected: List[str] = Field(description="Exact relative paths of files read.")
     findings: List[str] = Field(description="Concrete bugs, security risks, or architectural observations citing actual functions/lines.")
     recommendations: List[str] = Field(description="Actionable engineering improvements.")
 
@@ -75,7 +85,7 @@ class RepoAuditReport(BaseModel):
 # --- 3. LangGraph State & Nodes ---
 class AgentState(TypedDict):
     messages: Annotated[List[BaseMessage], add_messages]
-    reads_completed: int
+    guardrail_retries: int
     final_report: dict
 
 
@@ -83,21 +93,55 @@ llm = ChatOllama(model="qwen2.5:7b", temperature=0)
 llm_with_tools = llm.bind_tools(tools)
 
 
+def _get_read_paths(messages: List[BaseMessage]) -> List[str]:
+    paths = []
+    for m in messages:
+        if isinstance(m, AIMessage) and getattr(m, "tool_calls", None):
+            for tc in m.tool_calls:
+                if tc["name"] == "read_file" and "relative_path" in tc["args"]:
+                    paths.append(tc["args"]["relative_path"])
+    return paths
+
+
 def investigator_node(state: AgentState) -> AgentState:
     print("[Investigator] Reasoning...")
-    response = llm_with_tools.invoke(state["messages"])
+    list_calls = sum(
+        1 for m in state["messages"]
+        if isinstance(m, ToolMessage) and m.name == "list_repo_files"
+    )
+    msgs = state["messages"]
+    if list_calls >= 2:
+        unread = [f for f in _discover_files() if f not in _get_read_paths(msgs)][:4]
+        msgs = msgs + [
+            HumanMessage(content=(
+                f"Do NOT call `list_repo_files` again. Call `read_file` on one of these unread files now: {unread}"
+            ))
+        ]
+    response = llm_with_tools.invoke(msgs)
     return {"messages": [response]}
 
 
 def enforce_reads_node(state: AgentState) -> AgentState:
-    print("[Guardrail] Agent tried to finish without reading enough files — forcing read_file...")
+    retries = state.get("guardrail_retries", 0) + 1
+    already_read = set(_get_read_paths(state["messages"]))
+    unread = [f for f in _discover_files() if f not in already_read]
+
+    if retries >= 2 or not unread:
+        print("[Guardrail] Auto-reading remaining target files before finalizing...")
+        injected = []
+        for path in unread[:2]:
+            content = (REPO_ROOT / path).read_text(encoding="utf-8", errors="ignore")[:6000]
+            injected.append(HumanMessage(content=f"Contents of `{path}`:\n```\n{content}\n```"))
+        return {"messages": injected, "guardrail_retries": retries}
+
+    print(f"[Guardrail] Nudge {retries}/2 — directing agent to read: {unread[:2]}")
     return {
+        "guardrail_retries": retries,
         "messages": [
             HumanMessage(content=(
-                "STOP. You have not read enough actual source files yet. "
-                "Pick 2 real file paths from the list above and call `read_file` on them right now before summarizing."
+                f"STOP. You still need to inspect actual files. Call `read_file` right now on: {unread[:2]}"
             ))
-        ]
+        ],
     }
 
 
@@ -108,28 +152,23 @@ def route_after_investigator(state: AgentState) -> str:
             print(f"  -> Tool: {tc['name']}({tc['args']})")
         return "tools"
 
-    # Count how many successful read_file calls happened so far
     read_count = sum(
         1 for m in state["messages"]
         if isinstance(m, ToolMessage) and m.name == "read_file" and not str(m.content).startswith("Error:")
     )
-    if read_count < 2:
+    min_needed = min(2, len(_discover_files()))
+    if read_count < min_needed and state.get("guardrail_retries", 0) < 2:
         return "enforce_reads"
     return "finalize"
 
 
 def finalizer_node(state: AgentState) -> AgentState:
     print("[Finalizer] Generating structured Markdown audit...")
-    actual_reads = [
-        m.artifact if getattr(m, "artifact", None) else ""
-        for m in state["messages"]
-        if isinstance(m, ToolMessage) and m.name == "read_file"
-    ]
     structured_llm = llm.with_structured_output(RepoAuditReport)
     prompt = state["messages"] + [
         HumanMessage(content=(
-            "Synthesize the final RepoAuditReport based STRICTLY on the contents returned by `read_file`. "
-            "Do not invent file names or functions that were not in the `read_file` outputs."
+            "Synthesize the final RepoAuditReport based STRICTLY on the file contents provided above. "
+            "Do not invent file names or functions that were not read."
         ))
     ]
     report: RepoAuditReport = structured_llm.invoke(prompt)
@@ -186,15 +225,18 @@ if __name__ == "__main__":
 
     initial_messages = [
         SystemMessage(content=(
-            "You are an autonomous codebase intelligence and security auditor. "
-            "1. Call `list_repo_files` first.\n"
-            "2. Call `read_file` on at least 2 real source files from that list.\n"
+            "You are an autonomous codebase intelligence and security auditor.\n"
+            "1. Call `list_repo_files` once.\n"
+            "2. Call `read_file` on at least 2 real files from that list.\n"
             "3. Ground every finding strictly in the code you read."
         )),
         HumanMessage(content=f"Perform a technical and security audit of the repository: {REPO_ROOT.name}")
     ]
 
-    result = app.invoke({"messages": initial_messages, "reads_completed": 0, "final_report": {}})
+    result = app.invoke(
+        {"messages": initial_messages, "guardrail_retries": 0, "final_report": {}},
+        config={"recursion_limit": 25},
+    )
     rep = result["final_report"]
 
     out_file = Path("audit_report.md")
