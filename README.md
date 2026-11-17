@@ -4,13 +4,15 @@ An autonomous, local-first codebase intelligence and security auditing agent bui
 
 ## Architecture
 
-The agent uses a cyclic ReAct state graph (`StateGraph`) powered by local LLM tool calling:
+The agent uses a cyclic ReAct state graph (`StateGraph`) with a deterministic read-enforcement guardrail to prevent local LLM hallucinations before generating the final report:
 
 ```text
-[Investigator (LLM)] ──(tool_calls)──> [ToolNode: list_repo_files / read_file / search_code]
-        ▲                                              │
-        └────────────────(observations)────────────────┘
+[Investigator (LLM)] ──(tool_calls)──▶ [ToolNode: list_repo_files / read_file / search_code]
+        ▲   ▲                                              │
+        │   └───────────────(observations)─────────────────┘
         │
-  (no tool calls)
+        ├──(insufficient reads)──▶ [Guardrail: enforce_reads]
+        │
+  (verified reads)
         ▼
-[Finalizer (Pydantic Schema)] ──> audit_report.md
+[Finalizer (Pydantic Schema)] ──▶ audit_report.md
