@@ -21,13 +21,15 @@ The agent uses a cyclic ReAct state graph (`StateGraph`) with a deterministic re
 ## Setup & Installation
 
 1. **Pull the local model in Ollama:**
+
    ```bash
    ollama pull qwen2.5:7b
    ```
 
 2. **Clone and install dependencies:**
+
    ```bash
-git clone [https://github.com/protoalchemico-arch/repo-intel-agent.git](https://github.com/protoalchemico-arch/repo-intel-agent.git)  
+   git clone [https://github.com/protoalchemico-arch/repo-intel-agent.git](https://github.com/protoalchemico-arch/repo-intel-agent.git)
    cd repo-intel-agent
    python -m venv .venv
    source .venv/bin/activate
