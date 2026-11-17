@@ -123,4 +123,132 @@ def investigator_node(state: AgentState) -> AgentState:
         unread = [f for f in _discover_files() if f not in _get_read_paths(msgs)][:4]
         msgs = msgs + [
             HumanMessage(content=(
-                f"Do NOT call `list_repo_files` again. Call `read_file` on one of
+                f"Do NOT call `list_repo_files` again. Call `read_file` on one of these unread files now: {unread}"
+            ))
+        ]
+    response = llm_with_tools.invoke(msgs)
+    return {"messages": [response]}
+
+
+def enforce_reads_node(state: AgentState) -> AgentState:
+    retries = state.get("guardrail_retries", 0) + 1
+    already_read = set(_get_read_paths(state["messages"]))
+    unread = [f for f in _discover_files() if f not in already_read]
+
+    if retries >= 2 or not unread:
+        print("[Guardrail] Auto-reading remaining target files before finalizing...")
+        injected = []
+        for path in unread[:2]:
+            content = (REPO_ROOT / path).read_text(encoding="utf-8", errors="ignore")[:6000]
+            injected.append(HumanMessage(content=f"Contents of `{path}`:\n```\n{content}\n```"))
+        return {"messages": injected, "guardrail_retries": retries}
+
+    print(f"[Guardrail] Nudge {retries}/2 — directing agent to read: {unread[:2]}")
+    return {
+        "guardrail_retries": retries,
+        "messages": [
+            HumanMessage(content=(
+                f"STOP. You still need to inspect actual files. Call `read_file` right now on: {unread[:2]}"
+            ))
+        ],
+    }
+
+
+def route_after_investigator(state: AgentState) -> str:
+    last_msg = state["messages"][-1]
+    if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
+        for tc in last_msg.tool_calls:
+            print(f"  -> Tool: {tc['name']}({tc['args']})")
+        return "tools"
+
+    read_count = sum(
+        1 for m in state["messages"]
+        if isinstance(m, ToolMessage) and m.name == "read_file" and not str(m.content).startswith("Error:")
+    )
+    min_needed = min(2, len(_discover_files()))
+    if read_count < min_needed and state.get("guardrail_retries", 0) < 2:
+        return "enforce_reads"
+    return "finalize"
+
+
+def finalizer_node(state: AgentState) -> AgentState:
+    print("[Finalizer] Generating structured Markdown audit...")
+    structured_llm = llm.with_structured_output(RepoAuditReport)
+    prompt = state["messages"] + [
+        HumanMessage(content=(
+            "Synthesize the final RepoAuditReport based STRICTLY on the file contents provided above. "
+            "Do not invent file names or functions that were not read."
+        ))
+    ]
+    report: RepoAuditReport = structured_llm.invoke(prompt)
+    return {"final_report": report.model_dump()}
+
+
+# --- 4. Compile Graph ---
+workflow = StateGraph(AgentState)
+workflow.add_node("investigator", investigator_node)
+workflow.add_node("tools", ToolNode(tools))
+workflow.add_node("enforce_reads", enforce_reads_node)
+workflow.add_node("finalizer", finalizer_node)
+
+workflow.set_entry_point("investigator")
+workflow.add_conditional_edges(
+    "investigator",
+    route_after_investigator,
+    {
+        "tools": "tools",
+        "enforce_reads": "enforce_reads",
+        "finalize": "finalizer",
+    },
+)
+workflow.add_edge("tools", "investigator")
+workflow.add_edge("enforce_reads", "investigator")
+workflow.add_edge("finalizer", END)
+
+app = workflow.compile()
+
+
+def save_markdown(report: dict, target_name: str, output_path: Path) -> None:
+    md = f"""# Repository Intelligence Audit: `{target_name}`
+
+## Summary
+{report['project_summary']}
+
+**Overall Severity:** `{report['severity']}`
+
+## Files Inspected
+{chr(10).join(f"- `{f}`" for f in report['files_inspected'])}
+
+## Key Findings
+{chr(10).join(f"- {item}" for item in report['findings'])}
+
+## Recommendations
+{chr(10).join(f"- {rec}" for rec in report['recommendations'])}
+"""
+    output_path.write_text(md, encoding="utf-8")
+
+
+if __name__ == "__main__":
+    target_dir = sys.argv[1] if len(sys.argv) > 1 else "."
+    REPO_ROOT = Path(target_dir).resolve()
+
+    initial_messages = [
+        SystemMessage(content=(
+            "You are an autonomous codebase intelligence and security auditor.\n"
+            "1. Call `list_repo_files` once.\n"
+            "2. Call `read_file` on at least 2 real files from that list.\n"
+            "3. Ground every finding strictly in the code you read."
+        )),
+        HumanMessage(content=f"Perform a technical and security audit of the repository: {REPO_ROOT.name}")
+    ]
+
+    result = app.invoke(
+        {"messages": initial_messages, "guardrail_retries": 0, "final_report": {}},
+        config={"recursion_limit": 25},
+    )
+    rep = result["final_report"]
+
+    out_file = Path("audit_report.md")
+    save_markdown(rep, REPO_ROOT.name, out_file)
+    print(f"\nAudit complete! Report written to {out_file.resolve()}\n")
+    print(out_file.read_text(encoding="utf-8"))
